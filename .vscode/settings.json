@@ -1,7 +1,14 @@
 {
 	"cSpell.words": [
-		"Kontakte",
-		"lexopt",
-		"xshell"
-	]
+        "clippy",
+        "Kontakte",
+        "lexopt",
+        "msvc",
+        "RUSTFLAGS",
+        "rustfmt",
+        "rustup",
+        "statshouse",
+        "VKCOM",
+        "xshell"
+    ]
 }
