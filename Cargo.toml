@@ -1,0 +1,39 @@
+[workspace]
+members = ["statshouse", "xtask"]
+resolver = "2"
+
+[profile.dev]
+debug = 0
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test]
+opt-level = 1
+
+[workspace.package]
+version = "0.1.0"
+authors = ["V Kontakte LLC"]
+homepage = "https://github.com/vkcom/statshouse-rs"
+repository = "https://github.com/vkcom/statshouse-rs"
+categories = [
+    "statshouse",
+    "observability",
+    "metrics",
+    "monitoring",
+]
+license = "MPL-2.0"
+edition = "2021"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+unwrap_used = "forbid"
+
+[workspace.dependencies]
+lexopt = "0.3.0"
+xshell = "0.2.6"

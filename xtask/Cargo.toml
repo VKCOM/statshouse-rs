@@ -1,0 +1,13 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+license.workspace = true
+edition.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+lexopt.workspace = true
+xshell.workspace = true
