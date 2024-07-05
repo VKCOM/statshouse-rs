@@ -54,6 +54,11 @@ fn run_bench(parser: &mut Parser, sh: &Shell) -> Result<(), BoxedError> {
 fn run_ci(parser: &mut Parser, sh: &Shell) -> Result<(), BoxedError> {
     assert_no_more_args(parser)?;
 
+    cmd!(
+        sh,
+        "go run github.com/vkcom/statshouse/cmd/statshouse-client-test@master"
+    )
+    .run()?;
     cmd!(sh, "cargo fmt --check").run()?;
     cmd!(sh, "cargo clippy -- -D warnings").run()?;
     cmd!(sh, "cargo test --quiet").run()?;
