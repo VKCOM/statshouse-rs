@@ -1,5 +1,4 @@
 use std::{thread, time};
-{{ .Include "https://raw.githubusercontent.com/VKCOM/statshouse-rs/malpinskiy/dev/statshouse/src/lib.rs" }}
 
 fn main() {
     let mut t = Transport::default();
