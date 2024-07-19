@@ -1,7 +1,7 @@
 use std::{thread, time};
 
 fn main() {
-    let mut t = Transport::default();
+    let mut t = statshouse::Transport::default();
     let mut i = 0;
     while i<{{.NumberOfIterations}} {
     {{- range $v := .Metrics }}
