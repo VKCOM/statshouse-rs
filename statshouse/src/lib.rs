@@ -5,7 +5,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::cmp;
-use std::io::Error;
+use std::io::{Error, ErrorKind};
 use std::net::{Ipv4Addr, ToSocketAddrs, UdpSocket};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,8 +26,27 @@ pub struct Transport {
     tl_buffer: TLBuffer<MAX_DATAGRAM_SIZE>,
     batch_count: u32,
     last_flush: u32,
+    stats: Stats,
+    external_time: bool,
 }
 
+#[derive(Default, Copy, Clone)]
+pub struct Stats {
+    pub metrics_overflow: usize,
+    pub metrics_failed: usize,
+    pub metrics_too_big: usize,
+    pub packets_overflow: usize,
+    pub packets_failed: usize,
+}
+
+/// # Examples
+///
+/// ```
+/// let mut t = statshouse::Transport::default();
+/// statshouse::MetricBuilder::new(b"test").tag(b"0", b"staging").tag(b"1", b"test").write_count(&mut t, 1.0, 0);
+/// let mut m = statshouse::MetricBuilder::new(b"test").tag(b"0", b"staging").tag(b"1", b"test").clone();
+/// t.write_count(&m, 1.0, 0);
+/// ```
 impl Transport {
     pub fn new<A: ToSocketAddrs>(addr: A) -> Transport {
         let mut tl_buffer = TLBuffer::new(BATCH_HEADER_LEN);
@@ -37,20 +56,39 @@ impl Transport {
             tl_buffer,
             batch_count: 0,
             last_flush: unix_time_now(),
+            stats: Stats::default(),
+            external_time: false,
         }
     }
 
-    pub fn metric(&mut self, metric_name: &[u8]) -> Metric {
-        Metric::new(self, metric_name)
+    #[must_use]
+    pub fn get_stats(&self) -> Stats {
+        self.stats
     }
 
-    fn write_count(&mut self, builder: &MetricBuilder, count: f64, mut timestamp: u32) -> bool {
+    pub fn clear_stats(&mut self) {
+        self.stats = Stats::default();
+    }
+
+    pub fn set_external_time(&mut self, now: u32) {
+        if self.external_time && self.last_flush == now {
+            return;
+        }
+        self.external_time = true;
+        self.flush(now);
+    }
+
+    pub fn write_count(&mut self, builder: &MetricBuilder, count: f64, mut timestamp: u32) -> bool {
         if count <= 0. {
+            return false;
+        }
+        if builder.tl_buffer_overflow {
+            self.stats.metrics_too_big += 1;
             return false;
         }
         let mut len: usize = 4 + builder.tl_buffer.pos + 8; // field mask + header + counter
         let mut field_mask: u32 = TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK;
-        let now = unix_time_now();
+        let now = self.time_now();
         if timestamp == 0 {
             timestamp = now;
         }
@@ -68,13 +106,22 @@ impl Transport {
         true
     }
 
-    fn write_values(
+    pub fn write_value(&mut self, builder: &MetricBuilder, val: f64, timestamp: u32) -> bool {
+        let vals: [f64; 1] = [val];
+        self.write_values(builder, &vals, 0., timestamp)
+    }
+
+    pub fn write_values(
         &mut self,
         builder: &MetricBuilder,
         vals: &[f64],
         count: f64,
         mut timestamp: u32,
     ) -> bool {
+        if builder.tl_buffer_overflow {
+            self.stats.metrics_too_big += 1;
+            return false;
+        }
         let mut len: usize = 4 + builder.tl_buffer.pos + 4 + 8; // field mask + header + array length + single array value
         let mut field_mask: u32 = TL_STATSHOUSE_METRIC_VALUE_FIELDS_MASK;
         #[allow(clippy::cast_precision_loss, clippy::float_cmp)]
@@ -82,7 +129,7 @@ impl Transport {
             field_mask |= TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK;
             len += 8;
         }
-        let now = unix_time_now();
+        let now = self.time_now();
         if timestamp == 0 {
             timestamp = now;
         }
@@ -107,13 +154,22 @@ impl Transport {
         true
     }
 
-    fn write_uniques(
+    pub fn write_unique(&mut self, builder: &MetricBuilder, val: u64, timestamp: u32) -> bool {
+        let vals: [u64; 1] = [val];
+        self.write_uniques(builder, &vals, 0., timestamp)
+    }
+
+    pub fn write_uniques(
         &mut self,
         builder: &MetricBuilder,
         vals: &[u64],
         count: f64,
         mut timestamp: u32,
     ) -> bool {
+        if builder.tl_buffer_overflow {
+            self.stats.metrics_too_big += 1;
+            return false;
+        }
         let mut len: usize = 4 + builder.tl_buffer.pos + 4 + 8; // field mask + header + array length + single array value
         let mut field_mask: u32 = TL_STATSHOUSE_METRIC_UNIQUE_FIELDS_MASK;
         #[allow(clippy::cast_precision_loss, clippy::float_cmp)]
@@ -121,7 +177,7 @@ impl Transport {
             field_mask |= TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK;
             len += 8;
         }
-        let now = unix_time_now();
+        let now = self.time_now();
         if timestamp == 0 {
             timestamp = now;
         }
@@ -170,10 +226,25 @@ impl Transport {
         }
         if let Ok(socket) = self.socket.as_ref() {
             write_u32(&mut self.tl_buffer.arr, 8, self.batch_count); // # of batches
-            let _ = socket.send(&self.tl_buffer.arr[..self.tl_buffer.pos]); // TODO: report error if any
+            if let Err(ref e) = socket.send(&self.tl_buffer.arr[..self.tl_buffer.pos]) {
+                if e.kind() == ErrorKind::WouldBlock {
+                    self.stats.packets_overflow += 1;
+                    self.stats.metrics_overflow += self.batch_count as usize;
+                } else {
+                    self.stats.packets_failed += 1;
+                    self.stats.metrics_failed += self.batch_count as usize;
+                }
+            }
             self.batch_count = 0;
             self.tl_buffer.pos = BATCH_HEADER_LEN;
         }
+    }
+
+    fn time_now(&self) -> u32 {
+        if self.external_time {
+            return self.last_flush;
+        }
+        unix_time_now()
     }
 }
 
@@ -189,63 +260,8 @@ impl Drop for Transport {
     }
 }
 
-pub struct Metric<'a> {
-    transport: &'a mut Transport,
-    builder: MetricBuilder,
-}
-
-impl Metric<'_> {
-    fn new<'a>(transport: &'a mut Transport, metric_name: &[u8]) -> Metric<'a> {
-        Metric {
-            transport,
-            builder: MetricBuilder::new(metric_name),
-        }
-    }
-
-    pub fn tag<'a>(&'a mut self, key: &[u8], val: &[u8]) -> &'a mut Self {
-        self.builder.tag(key, val);
-        self
-    }
-
-    pub fn write_count(&mut self, counter: f64, timestamp: u32) -> bool {
-        if self.builder.tl_buffer_overflow {
-            // TODO: report failure
-            return false;
-        }
-        self.transport
-            .write_count(&self.builder, counter, timestamp)
-    }
-
-    pub fn write_value(&mut self, val: f64, timestamp: u32) -> bool {
-        let vals: [f64; 1] = [val];
-        self.write_values(&vals, 0., timestamp)
-    }
-
-    pub fn write_unique(&mut self, val: u64, timestamp: u32) -> bool {
-        let vals: [u64; 1] = [val];
-        self.write_uniques(&vals, 0., timestamp)
-    }
-
-    pub fn write_values(&mut self, vals: &[f64], count: f64, timestamp: u32) -> bool {
-        if self.builder.tl_buffer_overflow {
-            // TODO: report failure
-            return false;
-        }
-        self.transport
-            .write_values(&self.builder, vals, count, timestamp)
-    }
-
-    pub fn write_uniques(&mut self, vals: &[u64], count: f64, timestamp: u32) -> bool {
-        if self.builder.tl_buffer_overflow {
-            // TODO: report failure
-            return false;
-        }
-        self.transport
-            .write_uniques(&self.builder, vals, count, timestamp)
-    }
-}
-
-struct MetricBuilder {
+#[derive(Clone)]
+pub struct MetricBuilder {
     tl_buffer: TLBuffer<MAX_FULL_KEY_SIZE>,
     tl_buffer_overflow: bool,
     tag_count: u32,
@@ -253,7 +269,8 @@ struct MetricBuilder {
 }
 
 impl MetricBuilder {
-    fn new(metric_name: &[u8]) -> MetricBuilder {
+    #[must_use]
+    pub fn new(metric_name: &[u8]) -> MetricBuilder {
         let mut m = MetricBuilder {
             tl_buffer: TLBuffer::new(0),
             tl_buffer_overflow: false,
@@ -269,7 +286,7 @@ impl MetricBuilder {
         m
     }
 
-    fn tag<'a>(&'a mut self, name: &[u8], value: &[u8]) -> &'a mut Self {
+    pub fn tag<'a>(&'a mut self, name: &[u8], value: &[u8]) -> &'a mut Self {
         if self.tl_buffer.write_string(name) && self.tl_buffer.write_string(value) {
             self.tag_count += 1;
         } else {
@@ -277,8 +294,41 @@ impl MetricBuilder {
         }
         self
     }
+
+    pub fn write_count(&self, t: &mut Transport, count: f64, timestamp: u32) -> bool {
+        t.write_count(self, count, timestamp)
+    }
+
+    pub fn write_value(&self, t: &mut Transport, val: f64, timestamp: u32) -> bool {
+        t.write_value(self, val, timestamp)
+    }
+
+    pub fn write_values(
+        &self,
+        t: &mut Transport,
+        vals: &[f64],
+        count: f64,
+        timestamp: u32,
+    ) -> bool {
+        t.write_values(self, vals, count, timestamp)
+    }
+
+    pub fn write_unique(&self, t: &mut Transport, val: u64, timestamp: u32) -> bool {
+        t.write_unique(self, val, timestamp)
+    }
+
+    pub fn write_uniques(
+        &self,
+        t: &mut Transport,
+        vals: &[u64],
+        count: f64,
+        timestamp: u32,
+    ) -> bool {
+        t.write_uniques(self, vals, count, timestamp)
+    }
 }
 
+#[derive(Copy, Clone)]
 struct TLBuffer<const N: usize> {
     arr: [u8; N],
     pos: usize,
