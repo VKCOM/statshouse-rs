@@ -5,24 +5,24 @@ fn main() {
     let mut i = 0;
     while i<{{.NumberOfIterations}} {
     {{- range $v := .Metrics }}
-        t.metric(b"{{ $v.Name }}")
+        statshouse::MetricBuilder::new(b"{{ $v.Name }}")
         {{- range $v := $v.Tags -}}
             .tag(b"{{ index $v 0 }}",b"{{ index $v 1 }}")
         {{- end -}}
         {{- if eq $v.Kind 2 -}}
-        .write_uniques(&[
+        .write_uniques(&mut t, &[
             {{- range $i, $v := $v.Uniques -}}
                 {{ if $i }},{{ end }}{{ $v }}
             {{- end -}}
         ],{{ printf "%.1f" $v.Count }},{{ $v.Timestamp }});
         {{- else if eq $v.Kind 1 -}}
-        .write_values(&[
+        .write_values(&mut t, &[
             {{- range $i, $v := $v.Values -}}
                 {{ if $i }},{{ end }}{{ $v }}
             {{- end -}}
         ],{{ printf "%.1f" $v.Count }},{{ $v.Timestamp }});
         {{- else -}}
-        .write_count({{ printf "%.1f" $v.Count }},{{ $v.Timestamp }});
+        .write_count(&mut t, {{ printf "%.1f" $v.Count }},{{ $v.Timestamp }});
         {{- end -}}
     {{- end }}
     i+=1;

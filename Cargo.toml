@@ -30,8 +30,8 @@ edition = "2021"
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
-all = "warn"
-pedantic = "warn"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
 unwrap_used = "forbid"
 
 [workspace.dependencies]
