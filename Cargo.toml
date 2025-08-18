@@ -13,10 +13,12 @@ opt-level = 2
 opt-level = 1
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 authors = ["V Kontakte LLC"]
-homepage = "https://github.com/vkcom/statshouse-rs"
-repository = "https://github.com/vkcom/statshouse-rs"
+homepage = "https://github.com/VKCOM/statshouse-rs"
+repository = "https://github.com/VKCOM/statshouse-rs"
+description = "Rust client library for StatsHouse metrics collection system"
+keywords = ["statshouse", "observability", "metrics", "monitoring", "telemetry"]
 categories = [
     "statshouse",
     "observability",
