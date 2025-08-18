@@ -38,4 +38,3 @@ unwrap_used = "forbid"
 
 [workspace.dependencies]
 lexopt = "0.3.0"
-xshell = "0.2.6"

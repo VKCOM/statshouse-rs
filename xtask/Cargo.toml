@@ -10,4 +10,3 @@ workspace = true
 
 [dependencies]
 lexopt.workspace = true
-xshell.workspace = true

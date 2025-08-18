@@ -5,7 +5,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use lexopt::Parser;
-use xshell::{cmd, Shell};
+use std::process::Command;
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -19,10 +19,9 @@ fn main() -> Result<(), BoxedError> {
         None
     };
 
-    let sh = Shell::new()?;
     match subcommand.as_deref() {
-        Some("bench") => run_bench(&mut parser, &sh),
-        Some("ci") => run_ci(&mut parser, &sh),
+        Some("bench") => run_bench(&mut parser),
+        Some("ci") => run_ci(&mut parser),
         Some(cmd) => Err(format!("unexpected subcommand: {cmd}").into()),
         None => Err("subcommand expected".into()),
     }
@@ -39,30 +38,71 @@ fn assert_no_more_args(parser: &mut Parser) -> Result<(), BoxedError> {
     }
 }
 
-fn run_bench(parser: &mut Parser, sh: &Shell) -> Result<(), BoxedError> {
+fn run_bench(parser: &mut Parser) -> Result<(), BoxedError> {
     assert_no_more_args(parser)?;
 
-    cmd!(
-        sh,
-        "cargo +nightly bench --features=_bench --quiet -- benches"
-    )
-    .run()?;
+    let status = Command::new("rustup")
+        .args([
+            "run",
+            "nightly",
+            "cargo",
+            "bench",
+            "--features=_bench",
+            "--quiet",
+            "--",
+            "benches",
+        ])
+        .status()?;
+
+    if !status.success() {
+        return Err(format!("bench command failed with status: {status}").into());
+    }
 
     Ok(())
 }
 
-fn run_ci(parser: &mut Parser, sh: &Shell) -> Result<(), BoxedError> {
+fn run_ci(parser: &mut Parser) -> Result<(), BoxedError> {
     assert_no_more_args(parser)?;
 
-    cmd!(
-        sh,
-        "go run github.com/vkcom/statshouse/cmd/statshouse-client-test@master"
-    )
-    .run()?;
-    cmd!(sh, "cargo fmt --check").run()?;
-    cmd!(sh, "cargo clippy -- -D warnings").run()?;
-    cmd!(sh, "cargo test --quiet").run()?;
-    cmd!(sh, "cargo +nightly bench --no-run --quiet").run()?;
+    // Run Go test
+    let status = Command::new("go")
+        .args([
+            "run",
+            "github.com/VKCOM/statshouse/cmd/statshouse-client-test@master",
+        ])
+        .status()?;
+
+    if !status.success() {
+        return Err(format!("go test command failed with status: {status}").into());
+    }
+    // Run cargo fmt check
+    let status = Command::new("cargo").args(["fmt", "--check"]).status()?;
+
+    if !status.success() {
+        return Err(format!("cargo fmt check failed with status: {status}").into());
+    }
+    // Run cargo clippy with warnings as errors
+    let status = Command::new("cargo")
+        .args(["clippy", "--", "-D", "warnings"])
+        .status()?;
+
+    if !status.success() {
+        return Err(format!("cargo clippy failed with status: {status}").into());
+    }
+    // Run cargo test
+    let status = Command::new("cargo").args(["test", "--quiet"]).status()?;
+
+    if !status.success() {
+        return Err(format!("cargo test failed with status: {status}").into());
+    }
+    // Run nightly bench (compile only)
+    let status = Command::new("rustup")
+        .args(["run", "nightly", "cargo", "bench", "--no-run", "--quiet"])
+        .status()?;
+
+    if !status.success() {
+        return Err(format!("nightly bench command failed with status: {status}").into());
+    }
 
     Ok(())
 }
