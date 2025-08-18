@@ -33,7 +33,7 @@ fn assert_no_more_args(parser: &mut Parser) -> Result<(), BoxedError> {
     match parser.next()? {
         Some(Short(c)) => Err(format!("unexpected option: -{c}").into()),
         Some(Long(s)) => Err(format!("unexpected option: --{s}").into()),
-        Some(Value(v)) => Err(format!("unexpected value: {v:?}").into()),
+        Some(Value(v)) => Err(format!("unexpected value: {}", v.display()).into()),
         None => Ok(()),
     }
 }

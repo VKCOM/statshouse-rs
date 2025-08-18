@@ -282,7 +282,7 @@ impl MetricBuilder {
             m.tl_buffer_overflow = !m.tl_buffer.write_u32(0);
         } else {
             m.tl_buffer_overflow = true;
-        };
+        }
         m
     }
 
