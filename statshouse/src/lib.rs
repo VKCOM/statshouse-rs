@@ -6,7 +6,7 @@
 
 use std::cmp;
 use std::io::{Error, ErrorKind, Write};
-use std::net::{Ipv4Addr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:13337";
@@ -22,6 +22,7 @@ const MAX_UDP_DATAGRAM_SIZE: usize = 9216; // sysctl net.inet.udp.maxdgram
 #[cfg(not(target_os = "macos"))]
 const MAX_UDP_DATAGRAM_SIZE: usize = 65507; // https://stackoverflow.com/questions/42609561/udp-maximum-packet-size/42610200
 const MAX_TCP_PACKET_SIZE: usize = u16::MAX as usize;
+const MAX_TCP_PENDING_SIZE: usize = MAX_TCP_PACKET_SIZE;
 const MAX_PACKET_SIZE: usize = MAX_TCP_PACKET_SIZE;
 const MAX_FULL_KEY_SIZE: usize = 4096; // roughly metric plus all tags
 const TL_MAX_TINY_STRING_LEN: usize = 253;
@@ -32,6 +33,12 @@ const TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK: u32 = 1 << 0;
 const TL_STATSHOUSE_METRIC_VALUE_FIELDS_MASK: u32 = 1 << 1;
 const TL_STATSHOUSE_METRIC_UNIQUE_FIELDS_MASK: u32 = 1 << 2;
 const TL_STATSHOUSE_METRIC_TS_FIELDS_MASK: u32 = 1 << 4;
+const TCP_RECONNECT_BACKOFF_SECS: u32 = 1;
+const CLIENT_WRITE_ERR_METRIC_NAME: &[u8] = b"__src_client_write_err";
+const CLIENT_WRITE_ERR_TAG_LANG: &[u8] = b"1";
+const CLIENT_WRITE_ERR_TAG_KIND: &[u8] = b"2";
+const CLIENT_WRITE_ERR_LANG_RUST: &[u8] = b"rust";
+const CLIENT_WRITE_ERR_KIND_WOULD_BLOCK: &[u8] = b"1";
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Network {
@@ -44,13 +51,24 @@ enum TransportSocket {
     Tcp(TcpStream),
 }
 
+/// Transport for `StatsHouse` metrics.
+///
+/// For TCP backpressure the transport keeps at most one pending batch; new
+/// batches are dropped (counted as overflow) until the pending batch drains.
+/// Dropped bytes are reported via `__src_client_write_err` once the connection
+/// becomes writable again.
 pub struct Transport {
     socket: Result<TransportSocket, Error>,
+    network: Network,
+    tcp_addrs: Vec<SocketAddr>,
     tl_buffer: TLBuffer<MAX_PACKET_SIZE>,
     batch_count: u32,
+    // Bounded to MAX_TCP_PENDING_SIZE to avoid unbounded growth on backpressure.
     tcp_pending: Vec<u8>,
     tcp_pending_pos: usize,
     tcp_pending_metrics: u32,
+    tcp_lost_bytes: usize,
+    last_reconnect: u32,
     last_flush: u32,
     stats: Stats,
     external_time: bool,
@@ -97,17 +115,37 @@ impl Transport {
             BATCH_TAG_POS,
             TL_STATSHOUSE_METRICS_BATCH_TAG,
         ); // TL tag
-        let socket = match network {
-            Network::Tcp => create_tcp_stream(addr).map(TransportSocket::Tcp),
-            Network::Udp => create_udp_socket(addr).map(TransportSocket::Udp),
+        let (socket, tcp_addrs) = match resolve_addrs(addr) {
+            Ok(addrs) => {
+                let socket = match network {
+                    Network::Tcp => create_tcp_stream(&addrs).map(TransportSocket::Tcp),
+                    Network::Udp => create_udp_socket(&addrs).map(TransportSocket::Udp),
+                };
+                let tcp_addrs = if network == Network::Tcp {
+                    addrs
+                } else {
+                    Vec::new()
+                };
+                (socket, tcp_addrs)
+            }
+            Err(err) => (Err(err), Vec::new()),
+        };
+        let tcp_pending = if network == Network::Tcp {
+            Vec::with_capacity(MAX_TCP_PENDING_SIZE)
+        } else {
+            Vec::new()
         };
         Self {
             socket,
+            network,
+            tcp_addrs,
             tl_buffer,
             batch_count: 0,
-            tcp_pending: Vec::new(),
+            tcp_pending,
             tcp_pending_pos: 0,
             tcp_pending_metrics: 0,
+            tcp_lost_bytes: 0,
+            last_reconnect: 0,
             last_flush: unix_time_now(),
             stats: Stats::default(),
             external_time: false,
@@ -272,33 +310,38 @@ impl Transport {
 
     fn flush(&mut self, now: u32) {
         self.last_flush = now;
-        if self.batch_count == 0 && self.tcp_pending.is_empty() {
+        if self.batch_count == 0 && self.tcp_pending.is_empty() && self.tcp_lost_bytes == 0 {
             return;
         }
-        let Transport {
-            socket,
-            tl_buffer,
-            batch_count,
-            tcp_pending,
-            tcp_pending_pos,
-            tcp_pending_metrics,
-            stats,
-            ..
-        } = self;
-        let Some(socket) = socket.as_mut().ok() else {
+        if self.network == Network::Tcp && self.socket.is_err() && !self.reconnect_tcp() {
             return;
+        }
+        let reconnect = match self.socket.as_mut() {
+            Ok(TransportSocket::Udp(sock)) => {
+                flush_udp(
+                    sock,
+                    &mut self.batch_count,
+                    &mut self.tl_buffer,
+                    &mut self.stats,
+                );
+                false
+            }
+            Ok(TransportSocket::Tcp(stream)) => {
+                let mut state = TcpFlushState {
+                    batch_count: &mut self.batch_count,
+                    tl_buffer: &mut self.tl_buffer,
+                    stats: &mut self.stats,
+                    pending: &mut self.tcp_pending,
+                    pending_pos: &mut self.tcp_pending_pos,
+                    pending_metrics: &mut self.tcp_pending_metrics,
+                    lost_bytes: &mut self.tcp_lost_bytes,
+                };
+                flush_tcp(stream, &mut state)
+            }
+            Err(_) => return,
         };
-        match socket {
-            TransportSocket::Udp(sock) => flush_udp(sock, batch_count, tl_buffer, stats),
-            TransportSocket::Tcp(stream) => flush_tcp(
-                stream,
-                batch_count,
-                tl_buffer,
-                stats,
-                tcp_pending,
-                tcp_pending_pos,
-                tcp_pending_metrics,
-            ),
+        if reconnect {
+            self.reconnect_tcp();
         }
     }
 
@@ -308,12 +351,49 @@ impl Transport {
         }
         unix_time_now()
     }
+
+    fn reconnect_tcp(&mut self) -> bool {
+        if self.network != Network::Tcp {
+            return false;
+        }
+        if self.tcp_addrs.is_empty() {
+            return false;
+        }
+        let now = unix_time_now();
+        if now.saturating_sub(self.last_reconnect) < TCP_RECONNECT_BACKOFF_SECS {
+            return false;
+        }
+        self.last_reconnect = now;
+        self.tcp_pending.clear();
+        self.tcp_pending_pos = 0;
+        self.tcp_pending_metrics = 0;
+        match create_tcp_stream(&self.tcp_addrs) {
+            Ok(stream) => {
+                self.socket = Ok(TransportSocket::Tcp(stream));
+                true
+            }
+            Err(err) => {
+                self.socket = Err(err);
+                false
+            }
+        }
+    }
 }
 
 enum PendingState {
     Drained,
     Pending,
     Error,
+}
+
+struct TcpFlushState<'a> {
+    batch_count: &'a mut u32,
+    tl_buffer: &'a mut TLBuffer<MAX_PACKET_SIZE>,
+    stats: &'a mut Stats,
+    pending: &'a mut Vec<u8>,
+    pending_pos: &'a mut usize,
+    pending_metrics: &'a mut u32,
+    lost_bytes: &'a mut usize,
 }
 
 fn reset_current_batch(batch_count: &mut u32, tl_buffer: &mut TLBuffer<MAX_PACKET_SIZE>) {
@@ -339,6 +419,43 @@ fn drop_current_batch_failed(
     stats.packets_failed += 1;
     stats.metrics_failed += *batch_count as usize;
     reset_current_batch(batch_count, tl_buffer);
+}
+
+fn record_tcp_overflow_bytes(tcp_lost_bytes: &mut usize, lost_bytes: usize) {
+    if lost_bytes == 0 {
+        return;
+    }
+    *tcp_lost_bytes = tcp_lost_bytes.saturating_add(lost_bytes);
+}
+
+fn lost_bytes_to_value(lost_bytes: usize) -> f64 {
+    f64::from(u32::try_from(lost_bytes).unwrap_or(u32::MAX))
+}
+
+fn append_write_err_metric(
+    tl_buffer: &mut TLBuffer<MAX_PACKET_SIZE>,
+    batch_count: &mut u32,
+    lost_bytes: usize,
+) -> bool {
+    if lost_bytes == 0 {
+        return false;
+    }
+    let mut builder = MetricBuilder::new(CLIENT_WRITE_ERR_METRIC_NAME);
+    builder
+        .tag(CLIENT_WRITE_ERR_TAG_LANG, CLIENT_WRITE_ERR_LANG_RUST)
+        .tag(CLIENT_WRITE_ERR_TAG_KIND, CLIENT_WRITE_ERR_KIND_WOULD_BLOCK);
+    if builder.tl_buffer_overflow {
+        return false;
+    }
+    let required = 4 + builder.tl_buffer.pos + 4 + 8;
+    if !tl_buffer.enough_space(required) {
+        return false;
+    }
+    tl_buffer.write_header_unchecked(TL_STATSHOUSE_METRIC_VALUE_FIELDS_MASK, &builder, 0.0, 0);
+    let values = [lost_bytes_to_value(lost_bytes)];
+    tl_buffer.write_values_unchecked(&values, 1);
+    *batch_count += 1;
+    true
 }
 
 fn drain_tcp_pending(
@@ -388,58 +505,95 @@ fn flush_udp(
     reset_current_batch(batch_count, tl_buffer);
 }
 
-fn flush_tcp(
-    stream: &mut TcpStream,
-    batch_count: &mut u32,
-    tl_buffer: &mut TLBuffer<MAX_PACKET_SIZE>,
-    stats: &mut Stats,
-    tcp_pending: &mut Vec<u8>,
-    tcp_pending_pos: &mut usize,
-    tcp_pending_metrics: &mut u32,
-) {
-    if !tcp_pending.is_empty() {
-        match drain_tcp_pending(stream, tcp_pending, tcp_pending_pos) {
+fn flush_tcp(stream: &mut TcpStream, state: &mut TcpFlushState<'_>) -> bool {
+    let mut needs_reconnect = false;
+    if !state.pending.is_empty() {
+        match drain_tcp_pending(stream, state.pending, state.pending_pos) {
             PendingState::Pending => {
-                if *batch_count != 0 {
-                    drop_current_batch_overflow(batch_count, tl_buffer, stats);
+                if *state.batch_count != 0 {
+                    record_tcp_overflow_bytes(state.lost_bytes, state.tl_buffer.pos);
+                    drop_current_batch_overflow(state.batch_count, state.tl_buffer, state.stats);
                 }
-                return;
+                return false;
             }
             PendingState::Error => {
-                stats.packets_failed += 1;
-                stats.metrics_failed += *tcp_pending_metrics as usize;
-                *tcp_pending_metrics = 0;
-                if *batch_count != 0 {
-                    drop_current_batch_failed(batch_count, tl_buffer, stats);
+                state.stats.packets_failed += 1;
+                state.stats.metrics_failed += *state.pending_metrics as usize;
+                *state.pending_metrics = 0;
+                if *state.batch_count != 0 {
+                    drop_current_batch_failed(state.batch_count, state.tl_buffer, state.stats);
                 }
-                return;
+                return true;
             }
             PendingState::Drained => {
-                *tcp_pending_metrics = 0;
+                *state.pending_metrics = 0;
             }
         }
     }
-    if *batch_count == 0 {
-        return;
-    }
-    write_u32(&mut tl_buffer.arr, BATCH_COUNT_POS, *batch_count);
-    let Ok(payload_len) = u32::try_from(tl_buffer.pos.saturating_sub(LENGTH_PREFIX_LEN)) else {
-        drop_current_batch_failed(batch_count, tl_buffer, stats);
-        return;
-    };
-    write_u32(&mut tl_buffer.arr, 0, payload_len);
-    let buf = &tl_buffer.arr[..tl_buffer.pos];
-    if let Ok(written) = write_tcp(stream, buf) {
-        if written < buf.len() {
-            tcp_pending.clear();
-            tcp_pending.extend_from_slice(buf);
-            *tcp_pending_pos = written;
-            *tcp_pending_metrics = *batch_count;
+    if *state.batch_count != 0 {
+        write_u32(
+            &mut state.tl_buffer.arr,
+            BATCH_COUNT_POS,
+            *state.batch_count,
+        );
+        let Ok(payload_len) = u32::try_from(state.tl_buffer.pos.saturating_sub(LENGTH_PREFIX_LEN))
+        else {
+            drop_current_batch_failed(state.batch_count, state.tl_buffer, state.stats);
+            return false;
+        };
+        write_u32(&mut state.tl_buffer.arr, 0, payload_len);
+        let buf = &state.tl_buffer.arr[..state.tl_buffer.pos];
+        if let Ok(written) = write_tcp(stream, buf) {
+            if written < buf.len() {
+                if buf.len() > state.pending.capacity() {
+                    drop_current_batch_failed(state.batch_count, state.tl_buffer, state.stats);
+                    return true;
+                }
+                state.pending.clear();
+                state.pending.extend_from_slice(buf);
+                *state.pending_pos = written;
+                *state.pending_metrics = *state.batch_count;
+            }
+            reset_current_batch(state.batch_count, state.tl_buffer);
+        } else {
+            drop_current_batch_failed(state.batch_count, state.tl_buffer, state.stats);
+            return true;
         }
-        reset_current_batch(batch_count, tl_buffer);
-    } else {
-        drop_current_batch_failed(batch_count, tl_buffer, stats);
     }
+    if !state.pending.is_empty() {
+        return false;
+    }
+    if *state.lost_bytes == 0 {
+        return false;
+    }
+    let mut err_batch_count = 0;
+    reset_current_batch(&mut err_batch_count, state.tl_buffer);
+    if !append_write_err_metric(state.tl_buffer, &mut err_batch_count, *state.lost_bytes) {
+        reset_current_batch(&mut err_batch_count, state.tl_buffer);
+        return false;
+    }
+    write_u32(&mut state.tl_buffer.arr, BATCH_COUNT_POS, err_batch_count);
+    let Ok(payload_len) = u32::try_from(state.tl_buffer.pos.saturating_sub(LENGTH_PREFIX_LEN))
+    else {
+        reset_current_batch(&mut err_batch_count, state.tl_buffer);
+        return false;
+    };
+    write_u32(&mut state.tl_buffer.arr, 0, payload_len);
+    let buf = &state.tl_buffer.arr[..state.tl_buffer.pos];
+    *state.lost_bytes = 0;
+    match write_tcp(stream, buf) {
+        Ok(written) => {
+            if written < buf.len() && buf.len() <= state.pending.capacity() {
+                state.pending.clear();
+                state.pending.extend_from_slice(buf);
+                *state.pending_pos = written;
+                *state.pending_metrics = 0;
+            }
+        }
+        Err(_) => needs_reconnect = true,
+    }
+    reset_current_batch(&mut err_batch_count, state.tl_buffer);
+    needs_reconnect
 }
 
 impl Default for Transport {
@@ -647,15 +801,23 @@ impl<const N: usize> TLBuffer<N> {
     }
 }
 
-fn create_udp_socket<A: ToSocketAddrs>(addr: A) -> Result<UdpSocket, Error> {
+fn resolve_addrs<A: ToSocketAddrs>(addr: A) -> Result<Vec<SocketAddr>, Error> {
+    let addrs: Vec<SocketAddr> = addr.to_socket_addrs()?.collect();
+    if addrs.is_empty() {
+        return Err(Error::new(ErrorKind::InvalidInput, "no resolved addresses"));
+    }
+    Ok(addrs)
+}
+
+fn create_udp_socket(addrs: &[SocketAddr]) -> Result<UdpSocket, Error> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
     socket.set_nonblocking(true)?;
-    socket.connect(addr)?;
+    socket.connect(addrs)?;
     Ok(socket)
 }
 
-fn create_tcp_stream<A: ToSocketAddrs>(addr: A) -> Result<TcpStream, Error> {
-    let mut stream = TcpStream::connect(addr)?;
+fn create_tcp_stream(addrs: &[SocketAddr]) -> Result<TcpStream, Error> {
+    let mut stream = TcpStream::connect(addrs)?;
     stream.write_all(TCP_HANDSHAKE)?;
     stream.set_nonblocking(true)?;
     Ok(stream)
