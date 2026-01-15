@@ -5,14 +5,24 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::cmp;
-use std::io::{Error, ErrorKind};
-use std::net::{Ipv4Addr, ToSocketAddrs, UdpSocket};
+use std::io::{Error, ErrorKind, Write};
+use std::net::{Ipv4Addr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const DEFAULT_ADDR: &str = "127.0.0.1:13337";
+const TCP_HANDSHAKE: &[u8] = b"statshousev1";
+const LENGTH_PREFIX_LEN: usize = 4;
+const BATCH_TAG_POS: usize = LENGTH_PREFIX_LEN;
+const BATCH_FIELD_MASK_POS: usize = BATCH_TAG_POS + 4;
+const BATCH_COUNT_POS: usize = BATCH_FIELD_MASK_POS + 4;
+const BATCH_HEADER_LEN: usize = BATCH_COUNT_POS + 4; // data length + TL tag + field mask + # of batches
+
 #[cfg(target_os = "macos")]
-const MAX_DATAGRAM_SIZE: usize = 9216; // sysctl net.inet.udp.maxdgram
+const MAX_UDP_DATAGRAM_SIZE: usize = 9216; // sysctl net.inet.udp.maxdgram
 #[cfg(not(target_os = "macos"))]
-const MAX_DATAGRAM_SIZE: usize = 65507; // https://stackoverflow.com/questions/42609561/udp-maximum-packet-size/42610200
+const MAX_UDP_DATAGRAM_SIZE: usize = 65507; // https://stackoverflow.com/questions/42609561/udp-maximum-packet-size/42610200
+const MAX_TCP_PACKET_SIZE: usize = u16::MAX as usize;
+const MAX_PACKET_SIZE: usize = MAX_TCP_PACKET_SIZE;
 const MAX_FULL_KEY_SIZE: usize = 4096; // roughly metric plus all tags
 const TL_MAX_TINY_STRING_LEN: usize = 253;
 const TL_BIG_STRING_LEN: usize = 0x00ff_ffff;
@@ -22,12 +32,25 @@ const TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK: u32 = 1 << 0;
 const TL_STATSHOUSE_METRIC_VALUE_FIELDS_MASK: u32 = 1 << 1;
 const TL_STATSHOUSE_METRIC_UNIQUE_FIELDS_MASK: u32 = 1 << 2;
 const TL_STATSHOUSE_METRIC_TS_FIELDS_MASK: u32 = 1 << 4;
-const BATCH_HEADER_LEN: usize = 12; // TL tag, field mask, # of batches
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum Network {
+    Tcp,
+    Udp,
+}
+
+enum TransportSocket {
+    Udp(UdpSocket),
+    Tcp(TcpStream),
+}
 
 pub struct Transport {
-    socket: Result<UdpSocket, Error>,
-    tl_buffer: TLBuffer<MAX_DATAGRAM_SIZE>,
+    socket: Result<TransportSocket, Error>,
+    tl_buffer: TLBuffer<MAX_PACKET_SIZE>,
     batch_count: u32,
+    tcp_pending: Vec<u8>,
+    tcp_pending_pos: usize,
+    tcp_pending_metrics: u32,
     last_flush: u32,
     stats: Stats,
     external_time: bool,
@@ -52,12 +75,39 @@ pub struct Stats {
 /// ```
 impl Transport {
     pub fn new<A: ToSocketAddrs>(addr: A) -> Transport {
-        let mut tl_buffer = TLBuffer::new(BATCH_HEADER_LEN);
-        write_u32(&mut tl_buffer.arr, 0, TL_STATSHOUSE_METRICS_BATCH_TAG); // TL tag
+        Transport::new_with_network(Network::Udp, addr)
+    }
+
+    pub fn tcp<A: ToSocketAddrs>(addr: A) -> Transport {
+        Transport::new_with_network(Network::Tcp, addr)
+    }
+
+    pub fn udp<A: ToSocketAddrs>(addr: A) -> Transport {
+        Transport::new_with_network(Network::Udp, addr)
+    }
+
+    fn new_with_network<A: ToSocketAddrs>(network: Network, addr: A) -> Transport {
+        let max_size = match network {
+            Network::Tcp => MAX_TCP_PACKET_SIZE,
+            Network::Udp => MAX_UDP_DATAGRAM_SIZE + LENGTH_PREFIX_LEN,
+        };
+        let mut tl_buffer = TLBuffer::new(BATCH_HEADER_LEN, max_size);
+        write_u32(
+            &mut tl_buffer.arr,
+            BATCH_TAG_POS,
+            TL_STATSHOUSE_METRICS_BATCH_TAG,
+        ); // TL tag
+        let socket = match network {
+            Network::Tcp => create_tcp_stream(addr).map(TransportSocket::Tcp),
+            Network::Udp => create_udp_socket(addr).map(TransportSocket::Udp),
+        };
         Self {
-            socket: create_udp_socket(addr),
+            socket,
             tl_buffer,
             batch_count: 0,
+            tcp_pending: Vec::new(),
+            tcp_pending_pos: 0,
+            tcp_pending_metrics: 0,
             last_flush: unix_time_now(),
             stats: Stats::default(),
             external_time: false,
@@ -127,8 +177,7 @@ impl Transport {
         }
         let mut len: usize = 4 + builder.tl_buffer.pos + 4 + 8; // field mask + header + array length + single array value
         let mut field_mask: u32 = TL_STATSHOUSE_METRIC_VALUE_FIELDS_MASK;
-        #[allow(clippy::cast_precision_loss, clippy::float_cmp)]
-        if count >= 0. && count != vals.len() as f64 {
+        if should_write_counter(count, vals.len()) {
             field_mask |= TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK;
             len += 8;
         }
@@ -147,10 +196,10 @@ impl Transport {
             }
             self.tl_buffer
                 .write_header_unchecked(field_mask, builder, count, timestamp);
-            tail = self.tl_buffer.write_values_unchecked(
-                tail,
-                cmp::min((self.tl_buffer.space_left() - 4) / 8, tail.len()),
-            );
+            let space = self.tl_buffer.space_left().saturating_sub(4);
+            tail = self
+                .tl_buffer
+                .write_values_unchecked(tail, cmp::min(space / 8, tail.len()));
             self.batch_count += 1;
         }
         self.maybe_flush(now);
@@ -175,8 +224,7 @@ impl Transport {
         }
         let mut len: usize = 4 + builder.tl_buffer.pos + 4 + 8; // field mask + header + array length + single array value
         let mut field_mask: u32 = TL_STATSHOUSE_METRIC_UNIQUE_FIELDS_MASK;
-        #[allow(clippy::cast_precision_loss, clippy::float_cmp)]
-        if count >= 0. && count != vals.len() as f64 {
+        if should_write_counter(count, vals.len()) {
             field_mask |= TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK;
             len += 8;
         }
@@ -195,10 +243,10 @@ impl Transport {
             }
             self.tl_buffer
                 .write_header_unchecked(field_mask, builder, count, timestamp);
-            tail = self.tl_buffer.write_uniques_unchecked(
-                tail,
-                cmp::min((self.tl_buffer.space_left() - 4) / 8, tail.len()),
-            );
+            let space = self.tl_buffer.space_left().saturating_sub(4);
+            tail = self
+                .tl_buffer
+                .write_uniques_unchecked(tail, cmp::min(space / 8, tail.len()));
             self.batch_count += 1;
         }
         self.maybe_flush(now);
@@ -224,22 +272,33 @@ impl Transport {
 
     fn flush(&mut self, now: u32) {
         self.last_flush = now;
-        if self.batch_count == 0 {
+        if self.batch_count == 0 && self.tcp_pending.is_empty() {
             return;
         }
-        if let Ok(socket) = self.socket.as_ref() {
-            write_u32(&mut self.tl_buffer.arr, 8, self.batch_count); // # of batches
-            if let Err(ref e) = socket.send(&self.tl_buffer.arr[..self.tl_buffer.pos]) {
-                if e.kind() == ErrorKind::WouldBlock {
-                    self.stats.packets_overflow += 1;
-                    self.stats.metrics_overflow += self.batch_count as usize;
-                } else {
-                    self.stats.packets_failed += 1;
-                    self.stats.metrics_failed += self.batch_count as usize;
-                }
-            }
-            self.batch_count = 0;
-            self.tl_buffer.pos = BATCH_HEADER_LEN;
+        let Transport {
+            socket,
+            tl_buffer,
+            batch_count,
+            tcp_pending,
+            tcp_pending_pos,
+            tcp_pending_metrics,
+            stats,
+            ..
+        } = self;
+        let Some(socket) = socket.as_mut().ok() else {
+            return;
+        };
+        match socket {
+            TransportSocket::Udp(sock) => flush_udp(sock, batch_count, tl_buffer, stats),
+            TransportSocket::Tcp(stream) => flush_tcp(
+                stream,
+                batch_count,
+                tl_buffer,
+                stats,
+                tcp_pending,
+                tcp_pending_pos,
+                tcp_pending_metrics,
+            ),
         }
     }
 
@@ -251,9 +310,141 @@ impl Transport {
     }
 }
 
+enum PendingState {
+    Drained,
+    Pending,
+    Error,
+}
+
+fn reset_current_batch(batch_count: &mut u32, tl_buffer: &mut TLBuffer<MAX_PACKET_SIZE>) {
+    *batch_count = 0;
+    tl_buffer.pos = BATCH_HEADER_LEN;
+}
+
+fn drop_current_batch_overflow(
+    batch_count: &mut u32,
+    tl_buffer: &mut TLBuffer<MAX_PACKET_SIZE>,
+    stats: &mut Stats,
+) {
+    stats.packets_overflow += 1;
+    stats.metrics_overflow += *batch_count as usize;
+    reset_current_batch(batch_count, tl_buffer);
+}
+
+fn drop_current_batch_failed(
+    batch_count: &mut u32,
+    tl_buffer: &mut TLBuffer<MAX_PACKET_SIZE>,
+    stats: &mut Stats,
+) {
+    stats.packets_failed += 1;
+    stats.metrics_failed += *batch_count as usize;
+    reset_current_batch(batch_count, tl_buffer);
+}
+
+fn drain_tcp_pending(
+    stream: &mut TcpStream,
+    pending: &mut Vec<u8>,
+    pending_pos: &mut usize,
+) -> PendingState {
+    let buf = &pending[*pending_pos..];
+    if let Ok(written) = write_tcp(stream, buf) {
+        *pending_pos += written;
+        if *pending_pos < pending.len() {
+            return PendingState::Pending;
+        }
+        pending.clear();
+        *pending_pos = 0;
+        PendingState::Drained
+    } else {
+        pending.clear();
+        *pending_pos = 0;
+        PendingState::Error
+    }
+}
+
+fn flush_udp(
+    sock: &UdpSocket,
+    batch_count: &mut u32,
+    tl_buffer: &mut TLBuffer<MAX_PACKET_SIZE>,
+    stats: &mut Stats,
+) {
+    if *batch_count == 0 {
+        return;
+    }
+    write_u32(&mut tl_buffer.arr, BATCH_COUNT_POS, *batch_count);
+    let Ok(payload_len) = u32::try_from(tl_buffer.pos.saturating_sub(LENGTH_PREFIX_LEN)) else {
+        drop_current_batch_failed(batch_count, tl_buffer, stats);
+        return;
+    };
+    write_u32(&mut tl_buffer.arr, 0, payload_len);
+    if let Err(ref e) = sock.send(&tl_buffer.arr[LENGTH_PREFIX_LEN..tl_buffer.pos]) {
+        if e.kind() == ErrorKind::WouldBlock {
+            drop_current_batch_overflow(batch_count, tl_buffer, stats);
+            return;
+        }
+        drop_current_batch_failed(batch_count, tl_buffer, stats);
+        return;
+    }
+    reset_current_batch(batch_count, tl_buffer);
+}
+
+fn flush_tcp(
+    stream: &mut TcpStream,
+    batch_count: &mut u32,
+    tl_buffer: &mut TLBuffer<MAX_PACKET_SIZE>,
+    stats: &mut Stats,
+    tcp_pending: &mut Vec<u8>,
+    tcp_pending_pos: &mut usize,
+    tcp_pending_metrics: &mut u32,
+) {
+    if !tcp_pending.is_empty() {
+        match drain_tcp_pending(stream, tcp_pending, tcp_pending_pos) {
+            PendingState::Pending => {
+                if *batch_count != 0 {
+                    drop_current_batch_overflow(batch_count, tl_buffer, stats);
+                }
+                return;
+            }
+            PendingState::Error => {
+                stats.packets_failed += 1;
+                stats.metrics_failed += *tcp_pending_metrics as usize;
+                *tcp_pending_metrics = 0;
+                if *batch_count != 0 {
+                    drop_current_batch_failed(batch_count, tl_buffer, stats);
+                }
+                return;
+            }
+            PendingState::Drained => {
+                *tcp_pending_metrics = 0;
+            }
+        }
+    }
+    if *batch_count == 0 {
+        return;
+    }
+    write_u32(&mut tl_buffer.arr, BATCH_COUNT_POS, *batch_count);
+    let Ok(payload_len) = u32::try_from(tl_buffer.pos.saturating_sub(LENGTH_PREFIX_LEN)) else {
+        drop_current_batch_failed(batch_count, tl_buffer, stats);
+        return;
+    };
+    write_u32(&mut tl_buffer.arr, 0, payload_len);
+    let buf = &tl_buffer.arr[..tl_buffer.pos];
+    if let Ok(written) = write_tcp(stream, buf) {
+        if written < buf.len() {
+            tcp_pending.clear();
+            tcp_pending.extend_from_slice(buf);
+            *tcp_pending_pos = written;
+            *tcp_pending_metrics = *batch_count;
+        }
+        reset_current_batch(batch_count, tl_buffer);
+    } else {
+        drop_current_batch_failed(batch_count, tl_buffer, stats);
+    }
+}
+
 impl Default for Transport {
     fn default() -> Self {
-        Transport::new("127.0.0.1:13337")
+        Transport::new(DEFAULT_ADDR)
     }
 }
 
@@ -275,7 +466,7 @@ impl MetricBuilder {
     #[must_use]
     pub fn new(metric_name: &[u8]) -> MetricBuilder {
         let mut m = MetricBuilder {
-            tl_buffer: TLBuffer::new(0),
+            tl_buffer: TLBuffer::new(0, MAX_FULL_KEY_SIZE),
             tl_buffer_overflow: false,
             tag_count: 0,
             tag_count_pos: 0,
@@ -335,11 +526,16 @@ impl MetricBuilder {
 struct TLBuffer<const N: usize> {
     arr: [u8; N],
     pos: usize,
+    limit: usize,
 }
 
 impl<const N: usize> TLBuffer<N> {
-    fn new(pos: usize) -> TLBuffer<N> {
-        TLBuffer { arr: [0; N], pos }
+    fn new(pos: usize, limit: usize) -> TLBuffer<N> {
+        TLBuffer {
+            arr: [0; N],
+            pos,
+            limit: limit.min(N),
+        }
     }
 
     fn write_header_unchecked(
@@ -447,7 +643,7 @@ impl<const N: usize> TLBuffer<N> {
     }
 
     fn space_left(&self) -> usize {
-        N - self.pos
+        self.limit.saturating_sub(self.pos)
     }
 }
 
@@ -458,12 +654,48 @@ fn create_udp_socket<A: ToSocketAddrs>(addr: A) -> Result<UdpSocket, Error> {
     Ok(socket)
 }
 
+fn create_tcp_stream<A: ToSocketAddrs>(addr: A) -> Result<TcpStream, Error> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.write_all(TCP_HANDSHAKE)?;
+    stream.set_nonblocking(true)?;
+    Ok(stream)
+}
+
+fn write_tcp(stream: &mut TcpStream, buf: &[u8]) -> Result<usize, Error> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        match stream.write(&buf[offset..]) {
+            Ok(0) => {
+                return Err(Error::new(
+                    ErrorKind::WriteZero,
+                    "failed to write to TCP stream",
+                ))
+            }
+            Ok(n) => offset += n,
+            Err(ref err) if err.kind() == ErrorKind::WouldBlock => return Ok(offset),
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(offset)
+}
+
 fn unix_time_now() -> u32 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         #[allow(clippy::cast_possible_truncation)]
         Ok(d) => d.as_secs() as u32,
         Err(_) => 0,
     }
+}
+
+fn should_write_counter(count: f64, len: usize) -> bool {
+    if count.is_nan() || count < 0.0 {
+        return false;
+    }
+    let Ok(len_u32) = u32::try_from(len) else {
+        return true;
+    };
+    let len_f = f64::from(len_u32);
+    (count - len_f).abs() > f64::EPSILON
 }
 
 fn write_u32<const N: usize>(dst: &mut [u8; N], pos: usize, val: u32) {
