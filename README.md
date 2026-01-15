@@ -66,3 +66,8 @@ Single command to run all checks: `cargo x ci`
 ## License
 
 MPL-2.0
+
+## TODO
+
+- Align `__src_client_write_err` tags with Go (env/app tags).
+- Re-resolve TCP addresses and retry queued batches on reconnect to match Go behavior.
