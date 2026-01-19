@@ -34,7 +34,7 @@ fn assert_no_more_args(parser: &mut Parser) -> Result<(), BoxedError> {
     match parser.next()? {
         Some(Short(c)) => Err(format!("unexpected option: -{c}").into()),
         Some(Long(s)) => Err(format!("unexpected option: --{s}").into()),
-        Some(Value(v)) => Err(format!("unexpected value: {v:?}").into()),
+        Some(Value(v)) => Err(format!("unexpected value: {}", v.display()).into()),
         None => Ok(()),
     }
 }
@@ -56,7 +56,7 @@ fn run_ci(parser: &mut Parser, sh: &Shell) -> Result<(), BoxedError> {
 
     cmd!(
         sh,
-        "go run github.com/vkcom/statshouse/cmd/statshouse-client-test@master"
+        "go run github.com/VKCOM/statshouse/cmd/statshouse-client-test@master"
     )
     .run()?;
     cmd!(sh, "cargo fmt --check").run()?;

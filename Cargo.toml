@@ -15,8 +15,8 @@ opt-level = 1
 [workspace.package]
 version = "0.1.0"
 authors = ["V Kontakte LLC"]
-homepage = "https://github.com/vkcom/statshouse-rs"
-repository = "https://github.com/vkcom/statshouse-rs"
+homepage = "https://github.com/VKCOM/statshouse-rs"
+repository = "https://github.com/VKCOM/statshouse-rs"
 categories = [
     "statshouse",
     "observability",

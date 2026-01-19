@@ -1,10 +1,13 @@
 [package]
 name = "statshouse"
 version.workspace = true
+description = "StatsHouse client library for Rust"
 authors.workspace = true
 homepage.workspace = true
 repository.workspace = true
-categories.workspace = true
+categories = ["api-bindings"]
+keywords = ["statshouse", "metrics"]
+readme = "../README.md"
 license.workspace = true
 edition.workspace = true
 

@@ -9,8 +9,11 @@ use std::io::{Error, ErrorKind};
 use std::net::{Ipv4Addr, ToSocketAddrs, UdpSocket};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "macos")]
+const MAX_DATAGRAM_SIZE: usize = 9216; // sysctl net.inet.udp.maxdgram
+#[cfg(not(target_os = "macos"))]
 const MAX_DATAGRAM_SIZE: usize = 65507; // https://stackoverflow.com/questions/42609561/udp-maximum-packet-size/42610200
-const MAX_FULL_KEY_SIZE: usize = 1024; // roughly metric plus all tags
+const MAX_FULL_KEY_SIZE: usize = 4096; // roughly metric plus all tags
 const TL_MAX_TINY_STRING_LEN: usize = 253;
 const TL_BIG_STRING_LEN: usize = 0x00ff_ffff;
 const TL_BIG_STRING_MARKER: usize = 0xfe;
@@ -282,7 +285,7 @@ impl MetricBuilder {
             m.tl_buffer_overflow = !m.tl_buffer.write_u32(0);
         } else {
             m.tl_buffer_overflow = true;
-        };
+        }
         m
     }
 
