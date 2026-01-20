@@ -15,7 +15,7 @@ Add the dependency:
 statshouse = "0.1.0"
 ```
 
-Send a counter metric:
+Send a counter metric (UDP by default):
 
 ```rust
 use statshouse::{MetricBuilder, Transport};
@@ -30,18 +30,32 @@ fn main() {
 }
 ```
 
-Send value metric:
+Send value metric over TCP:
 
 ```rust
 use statshouse::{MetricBuilder, Transport};
 
 fn main() {
-    let mut transport = Transport::new("127.0.0.1:13337");
+    let mut transport = Transport::tcp("127.0.0.1:13337");
 
     MetricBuilder::new(b"latency_ms")
         .tag(b"env", b"staging")
         .write_values(&mut transport, &[12.3, 18.9, 7.4], 0.0, 0);
 
+}
+```
+
+Use UDP explicitly:
+
+```rust
+use statshouse::{MetricBuilder, Transport};
+
+fn main() {
+    let mut transport = Transport::udp("127.0.0.1:13337");
+
+    MetricBuilder::new(b"requests_total")
+        .tag(b"env", b"staging")
+        .write_count(&mut transport, 1.0, 0);
 }
 ```
 
@@ -52,3 +66,8 @@ Single command to run all checks: `cargo x ci`
 ## License
 
 MPL-2.0
+
+## TODO
+
+- Align `__src_client_write_err` tags with Go (env/app tags).
+- Re-resolve TCP addresses and retry queued batches on reconnect to match Go behavior.
