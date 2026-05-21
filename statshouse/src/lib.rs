@@ -163,7 +163,7 @@ impl Transport {
             return;
         }
         self.external_time = true;
-        self.flush(now);
+        self.flush_impl(now);
     }
 
     pub fn write_count(&mut self, builder: &MetricBuilder, count: f64, mut timestamp: u32) -> bool {
@@ -295,17 +295,21 @@ impl Transport {
         if self.tl_buffer.pos == BATCH_HEADER_LEN {
             return false;
         }
-        self.flush(now);
+        self.flush_impl(now);
         self.tl_buffer.enough_space(len)
     }
 
     fn maybe_flush(&mut self, now: u32) {
         if self.last_flush != now {
-            self.flush(now);
+            self.flush_impl(now);
         }
     }
 
-    fn flush(&mut self, now: u32) {
+    pub fn flush(&mut self) {
+        self.flush_impl(self.time_now());
+    }
+
+    fn flush_impl(&mut self, now: u32) {
         self.last_flush = now;
         if self.batch_count == 0 && self.tcp_pending.is_empty() && self.tcp_lost_bytes == 0 {
             return;
@@ -647,7 +651,7 @@ impl Default for Transport {
 
 impl Drop for Transport {
     fn drop(&mut self) {
-        self.flush(0);
+        self.flush_impl(0);
     }
 }
 
