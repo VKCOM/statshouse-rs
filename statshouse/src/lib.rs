@@ -8,7 +8,7 @@ use std::cmp;
 use std::collections::VecDeque;
 use std::io::{Error, ErrorKind, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:13337";
 const TCP_HANDSHAKE: &[u8] = b"statshousev1";
@@ -35,6 +35,10 @@ const TL_STATSHOUSE_METRIC_VALUE_FIELDS_MASK: u32 = 1 << 1;
 const TL_STATSHOUSE_METRIC_UNIQUE_FIELDS_MASK: u32 = 1 << 2;
 const TL_STATSHOUSE_METRIC_TS_FIELDS_MASK: u32 = 1 << 4;
 const TCP_RECONNECT_BACKOFF_SECS: u32 = 1;
+// Bound on a single blocking write during `flush`, so an unresponsive server
+// cannot hang the caller forever. It bounds one write call, not the whole flush:
+// a server that keeps consuming keeps us going.
+const TCP_FLUSH_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_WRITE_ERR_METRIC_NAME: &[u8] = b"__src_client_write_err";
 const CLIENT_WRITE_ERR_TAG_LANG: &[u8] = b"1";
 const CLIENT_WRITE_ERR_TAG_KIND: &[u8] = b"2";
@@ -58,6 +62,10 @@ enum TransportSocket {
 /// batches; new batches are dropped (counted as overflow) once the queue is full.
 /// Dropped bytes are reported via `__src_client_write_err` once the connection
 /// becomes writable again.
+///
+/// Writing never blocks, but [`Transport::flush`] and `Drop` do: they send the
+/// queue synchronously, so data already accepted by the transport is delivered
+/// instead of being discarded when the socket closes.
 pub struct Transport {
     socket: Result<TransportSocket, Error>,
     network: Network,
@@ -305,13 +313,45 @@ impl Transport {
         }
     }
 
+    /// Sends everything buffered so far, blocking until it is out on the wire.
+    ///
+    /// An ordinary flush writes to a non-blocking socket and parks whatever the
+    /// kernel refuses in `tcp_pending`, counting on a *later* flush to retry. A
+    /// caller flushing before it drops the transport has no later flush, so that
+    /// backlog would be discarded silently when the socket closes. Running the
+    /// same pipeline over a blocking socket removes the difference: every batch
+    /// is written in full rather than queued.
     pub fn flush(&mut self) {
-        self.flush_impl(self.time_now());
+        let now = self.time_now();
+        let blocking = self.has_buffered_data() && self.set_flush_blocking(true);
+        self.flush_impl(now);
+        if blocking {
+            self.set_flush_blocking(false);
+        }
+    }
+
+    /// Switches the TCP socket in or out of the blocking mode `flush` writes in,
+    /// bounding a blocking write so an unresponsive server cannot hang the caller
+    /// for ever. Returns whether the mode changed and has to be restored.
+    fn set_flush_blocking(&mut self, blocking: bool) -> bool {
+        let Ok(TransportSocket::Tcp(stream)) = self.socket.as_mut() else {
+            return false;
+        };
+        if stream.set_nonblocking(!blocking).is_err() {
+            return false;
+        }
+        let timeout = blocking.then_some(TCP_FLUSH_WRITE_TIMEOUT);
+        let _ = stream.set_write_timeout(timeout);
+        true
+    }
+
+    fn has_buffered_data(&self) -> bool {
+        self.batch_count != 0 || !self.tcp_pending.is_empty() || self.tcp_lost_bytes != 0
     }
 
     fn flush_impl(&mut self, now: u32) {
         self.last_flush = now;
-        if self.batch_count == 0 && self.tcp_pending.is_empty() && self.tcp_lost_bytes == 0 {
+        if !self.has_buffered_data() {
             return;
         }
         if self.network == Network::Tcp && self.socket.is_err() && !self.reconnect_tcp() {
@@ -651,7 +691,9 @@ impl Default for Transport {
 
 impl Drop for Transport {
     fn drop(&mut self) {
-        self.flush_impl(0);
+        // The last chance to get buffered data out before the socket closes, which
+        // is exactly what flush is for.
+        self.flush();
     }
 }
 
@@ -881,7 +923,14 @@ fn write_tcp(stream: &mut TcpStream, buf: &[u8]) -> Result<usize, Error> {
                 ))
             }
             Ok(n) => offset += n,
-            Err(ref err) if err.kind() == ErrorKind::WouldBlock => return Ok(offset),
+            // Out of kernel buffer, or a blocking flush write hit its timeout
+            // (WouldBlock on unix, TimedOut elsewhere): report how far we got and
+            // let the caller park the rest.
+            Err(ref err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Ok(offset)
+            }
+            // Only reachable once flush switches the socket to blocking mode.
+            Err(ref err) if err.kind() == ErrorKind::Interrupted => {}
             Err(err) => return Err(err),
         }
     }
@@ -917,4 +966,91 @@ fn write_u64<const N: usize>(dst: &mut [u8; N], pos: usize, val: u64) {
 
 fn write_slice<const N: usize>(dst: &mut [u8; N], pos: usize, val: &[u8]) {
     dst[pos..pos + val.len()].copy_from_slice(val);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    // Enough queued batches that a lost tail is unmistakable, and a ceiling that
+    // stays well under TCP_PENDING_BUCKETS so nothing is dropped as overflow.
+    const QUEUED_BATCHES: usize = 8;
+    const MAX_REGRESSION_METRICS: u32 = 400_000;
+
+    /// A slow server must not cost us data: writing is non-blocking and parks the
+    /// overflow in `tcp_pending`, so `flush` has to send that queue instead of
+    /// leaving it to be discarded when the socket closes. Without it the tail of
+    /// the stream vanished silently — whole queued batches, plus a half-written
+    /// one the server drops as a truncated packet.
+    #[test]
+    fn flush_delivers_tcp_backlog_to_a_slow_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let (start_tx, start_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            // Read nothing until the writer says so: that is what backs the socket
+            // up and forces the transport to queue, which is the state under test.
+            start_rx.recv().expect("start signal");
+            let mut received = Vec::new();
+            sock.read_to_end(&mut received).expect("read");
+            received
+        });
+
+        let mut t = Transport::tcp(addr);
+        // Write until the transport has queued, rather than guessing a byte count:
+        // how much an unread socket absorbs varies by platform.
+        let mut written = 0;
+        while written < MAX_REGRESSION_METRICS && t.tcp_pending.len() < QUEUED_BATCHES {
+            MetricBuilder::new(b"flush_backlog_regression")
+                .tag(b"0", b"v")
+                .write_count(&mut t, 1., 1_700_000_000 + written % 70);
+            written += 1;
+        }
+        assert_eq!(
+            t.tcp_pending.len(),
+            QUEUED_BATCHES,
+            "socket never backed up, so the test proves nothing"
+        );
+        start_tx.send(()).expect("signal");
+        t.flush();
+        let stats = t.get_stats();
+        drop(t);
+
+        let (metrics, truncated) = count_metrics(&server.join().expect("server"));
+        assert!(!truncated, "server saw a truncated trailing packet");
+        assert_eq!(stats.metrics_overflow, 0, "metrics dropped as overflow");
+        assert_eq!(stats.metrics_failed, 0, "metrics dropped on write failure");
+        assert_eq!(metrics, written, "metrics lost on the wire");
+    }
+
+    /// Walks the length-prefixed batches a server would see and sums the metric
+    /// counts they declare. The bool reports a trailing batch that never arrived
+    /// in full — a real server discards those, so they are lost data too.
+    fn count_metrics(mut w: &[u8]) -> (u32, bool) {
+        let mut metrics = 0;
+        assert!(w.starts_with(TCP_HANDSHAKE), "missing TCP handshake");
+        w = &w[TCP_HANDSHAKE.len()..];
+        while !w.is_empty() {
+            if w.len() < BATCH_HEADER_LEN {
+                return (metrics, true);
+            }
+            let len = read_u32(w, 0) as usize;
+            if w.len() < LENGTH_PREFIX_LEN + len {
+                return (metrics, true);
+            }
+            assert_eq!(read_u32(w, BATCH_TAG_POS), TL_STATSHOUSE_METRICS_BATCH_TAG);
+            metrics += read_u32(w, BATCH_COUNT_POS);
+            w = &w[LENGTH_PREFIX_LEN + len..];
+        }
+        (metrics, false)
+    }
+
+    fn read_u32(w: &[u8], pos: usize) -> u32 {
+        let bytes: [u8; 4] = w[pos..pos + 4].try_into().expect("4 bytes");
+        u32::from_le_bytes(bytes)
+    }
 }
